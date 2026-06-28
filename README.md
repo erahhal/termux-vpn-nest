@@ -26,18 +26,19 @@ Doing this naively breaks in three places, all of which the script handles:
 ## Install
 
 ```sh
-# Get the code
 git clone https://github.com/erahhal/termux-vpn-nest.git
 cd termux-vpn-nest
-
-# h2 is the only Python dependency. Pure Python, fast install.
-pip install --user h2
+./install.sh
 ```
+
+`install.sh` does two things: `pip install --user h2` (the only Python
+dependency — pure Python, fast), and symlinks `start-vpn` into
+`$PREFIX/bin` so it's on PATH. Run `./uninstall.sh` to remove the symlink.
 
 ## First run
 
 ```sh
-./start-vpn
+start-vpn
 ```
 
 You'll get prompted for two things on the first run:
@@ -49,12 +50,12 @@ Hit `Ctrl+C` to tear down. The script restores Mullvad's original DNS settings (
 
 ## Subsequent runs
 
-Just `./start-vpn` — it'll reuse the saved session and the saved Headscale URL. If you want to force re-registration, generate a new key and pass it:
+Just `start-vpn` — it'll reuse the saved session and the saved Headscale URL. If you want to force re-registration, generate a new key and pass it:
 
 ```sh
-./start-vpn nodekey:abcdef...
+start-vpn nodekey:abcdef...
 # or
-AUTH_KEY=nodekey:abcdef... ./start-vpn
+AUTH_KEY=nodekey:abcdef... start-vpn
 ```
 
 ## What's in the repo
