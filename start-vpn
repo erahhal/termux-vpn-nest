@@ -1,0 +1,208 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# Resolve the script's own directory so we can find sibling files
+# (mullvad_dns.py) regardless of cwd.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Define our paths explicitly
+TERMUX_HOME="/data/data/com.termux/files/home"
+TAILSCALED="${TERMUX_HOME}/tailscaled"
+TAILSCALE="${TERMUX_HOME}/tailscale"
+STATE_FILE="${TERMUX_HOME}/tailscaled.state"
+LOG_FILE="${TERMUX_HOME}/tailscaled.log"
+PYTHON_BIN="/data/data/com.termux/files/usr/bin/python"
+
+# Persistent config (HEADSCALE_URL etc). Prompted for and saved on
+# first run; sourced as shell on subsequent runs.
+CONFIG_DIR="${TERMUX_HOME}/.config/termux-vpn-nest"
+CONFIG_FILE="${CONFIG_DIR}/config"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Headscale pre-auth key (generated in the Headscale admin UI).
+# Required for first-time registration. Subsequent runs reuse the saved
+# session and don't need a key.
+# Pass as first argument:  ./start-vpn <key>
+# or via env var:          AUTH_KEY=<key> ./start-vpn
+# If empty and not yet registered, you'll be prompted.
+AUTH_KEY="${1:-${AUTH_KEY:-}}"
+
+# DNS to use for tailscaled's Go resolver during startup (Mullvad will tunnel
+# the query). Once tailscaled is up it'll swap /etc/resolv.conf to MagicDNS.
+RESOLV_DNS="1.1.1.1"
+
+# Tailscale's MagicDNS server. We tell Mullvad to advertise this as the
+# system DNS so split-horizon names resolve everywhere, including
+# DoH-defaulting browsers, since Mullvad announces DNS via Android's
+# VpnService API.
+MAGIC_DNS="100.100.100.100"
+
+# gRPC client + saved DnsOptions location for the Mullvad management API.
+MULLVAD_DNS_PY="${SCRIPT_DIR}/mullvad_dns.py"
+MULLVAD_DNS_SAVE="/data/local/tmp/start-vpn-mullvad-dns.bin"
+# h2 was installed via `pip install --user h2`; expose it to root.
+# Auto-detect actual python3.X dir so a Termux Python upgrade won't break it.
+MULLVAD_DNS_PYPATH="$(echo "${TERMUX_HOME}/.local/lib/python"*/site-packages 2>/dev/null | awk '{print $1}')"
+
+# Detect the egress interface (Mullvad's tun) by asking the kernel
+# which device handles non-Tailscale outbound traffic.
+detect_egress_if() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+# Snapshot Mullvad's current DnsOptions, then tell its daemon (live, no
+# restart) to advertise MagicDNS as the tunnel DNS. Mullvad re-handshakes
+# the tunnel as part of applying the change (~3-5s of network blip).
+mullvad_dns_set() {
+  echo "[*] Saving Mullvad's current DnsOptions snapshot..."
+  PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" save "$MULLVAD_DNS_SAVE" \
+    || { echo "[-] Couldn't reach Mullvad's gRPC socket. Is Mullvad running?"; return 1; }
+  echo "[*] Switching Mullvad's tunnel DNS to $MAGIC_DNS (brief re-handshake)..."
+  PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" custom "$MAGIC_DNS"
+  # Wait until Mullvad reports Connected again before moving on, otherwise
+  # tailscaled tries to bootstrap through a half-up tunnel.
+  for _ in $(seq 1 15); do
+    ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "[-] Mullvad didn't come back within 15s; continuing anyway."
+}
+
+# Restore the snapshot taken by mullvad_dns_set. Safe to call even if
+# the snapshot is missing (e.g. when the script crashed before saving).
+mullvad_dns_restore() {
+  [ -f "$MULLVAD_DNS_SAVE" ] || return 0
+  echo "[*] Restoring Mullvad's original DnsOptions (brief re-handshake)..."
+  PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" restore "$MULLVAD_DNS_SAVE" \
+    && rm -f "$MULLVAD_DNS_SAVE"
+}
+
+# Re-exec under su if not already root. Lets the user invoke this script
+# as themselves (e.g. `./start-vpn <key>`) without prefixing `su -c '...'`.
+if [ "$EUID" -ne 0 ]; then
+  SELF="$(readlink -f "$0")"
+  exec su -c "$(printf '%q ' "$SELF" "$@")"
+fi
+
+# First-run setup: prompt for the Headscale URL and persist it.
+if [ -z "${HEADSCALE_URL:-}" ]; then
+  echo "[*] First-time setup: need your Headscale server URL."
+  read -r -p "    Headscale URL (e.g. https://vpn.example.com): " HEADSCALE_URL
+  if [ -z "$HEADSCALE_URL" ]; then
+    echo "[-] No URL provided. Aborting."
+    exit 1
+  fi
+  mkdir -p "$CONFIG_DIR"
+  printf 'HEADSCALE_URL=%q\n' "$HEADSCALE_URL" > "$CONFIG_FILE"
+  echo "[*] Saved to $CONFIG_FILE"
+fi
+
+# Function to clean up processes when Ctrl+C is pressed
+cleanup() {
+  echo -e "\n[!] Ctrl+C detected. Shutting down connections safely..."
+
+  echo "[*] Disconnecting from Headscale..."
+  $TAILSCALE down >/dev/null 2>&1
+
+  echo "[*] Killing tailscaled background engine..."
+  pkill tailscaled >/dev/null 2>&1
+
+  # Remove the main-table default route we added so Mullvad's tun isn't
+  # left with a dangling route if it disconnects.
+  ip route del default table main >/dev/null 2>&1
+
+  # Hand Mullvad's DNS back to whatever it was before we started.
+  mullvad_dns_restore
+
+  # Restore the read-only mount we flipped on startup.
+  mount -o remount,ro / >/dev/null 2>&1
+
+  echo "[+] All cleaned up. Exiting."
+  exit 0
+}
+
+# Trap the Ctrl+C (SIGINT) and exit (SIGTERM) signals
+trap cleanup SIGINT SIGTERM
+
+# Kill any stray tailscaled processes before starting
+pkill tailscaled >/dev/null 2>&1
+
+# tailscaled needs to read AND rewrite /etc/resolv.conf at runtime:
+#   - on startup, to resolve $HEADSCALE_URL (needs `nameserver` line)
+#   - once connected, to swap to MagicDNS (100.100.100.100) so peer
+#     names like 10.0.0.1 / *.homefree.vpn resolve
+# Android mounts / read-only by default, so MagicDNS swap fails silently.
+# Remount rw for the whole session; cleanup() puts it back to ro.
+echo "[*] Remounting / rw so tailscaled can manage /etc/resolv.conf..."
+mount -o remount,rw / 2>/dev/null
+if [ ! -f /etc/resolv.conf ]; then
+  echo "[*] Seeding /etc/resolv.conf (nameserver $RESOLV_DNS)..."
+  echo "nameserver $RESOLV_DNS" > /etc/resolv.conf
+fi
+
+# Push MagicDNS to Mullvad live (no daemon restart). This is what lets
+# every app on the device — including DoH-defaulting browsers — pick up
+# split-horizon names like admin.homefree.host, because Mullvad announces
+# the DNS server to all apps via Android's VpnService API.
+mullvad_dns_set
+
+# tailscaled sets fwmark 0x80000 on its own outbound sockets so they don't
+# loop back through its TUN. Routing rule 5210 sends those marked packets
+# to the 'main' table, which on Android has no default route. Result:
+# every dial returns "network is unreachable" before any login URL is
+# generated. Fix: copy the egress interface (Mullvad's tun) into main.
+EGRESS_IF=$(detect_egress_if)
+if [ -n "$EGRESS_IF" ]; then
+  echo "[*] Routing tailscaled's marked traffic via $EGRESS_IF (Mullvad)..."
+  ip route del default table main >/dev/null 2>&1
+  ip route add default dev "$EGRESS_IF" table main
+else
+  echo "[-] Warning: could not detect egress interface. Is Mullvad connected?"
+fi
+
+echo "[*] Starting tailscaled engine in background..."
+echo "[*] tailscaled log: $LOG_FILE"
+# Log tailscaled stdout/stderr so we can debug hangs
+: > "$LOG_FILE"
+$TAILSCALED --tun=userspace-tun --state=$STATE_FILE >>"$LOG_FILE" 2>&1 &
+
+# Wait for tailscaled's local API socket to be responsive (up to ~15s).
+# `tailscale status` returns 0 when logged in, non-zero with "Logged out"
+# in the output when not — either is a signal the daemon is ready.
+for _ in $(seq 1 15); do
+  $TAILSCALE status >/dev/null 2>&1 && break
+  $TAILSCALE status 2>&1 | grep -qi "logged out" && break
+  sleep 1
+done
+
+echo "[*] Initiating connection to Headscale..."
+echo "[*] KEEP THIS TERMINAL OPEN. Press Ctrl+C to disconnect."
+echo "--------------------------------------------------------"
+
+# Ask tailscaled whether we already have a valid session. If not (and no
+# key was supplied), prompt for a pre-auth key before calling `up`.
+if [ -z "$AUTH_KEY" ] && $TAILSCALE status 2>&1 | grep -qi "logged out"; then
+  echo "[*] Client is not yet registered."
+  echo "    Generate a pre-auth key in the Headscale admin UI and paste it here."
+  read -r -p "Pre-auth key: " AUTH_KEY
+  if [ -z "$AUTH_KEY" ]; then
+    echo "[-] No key provided. Aborting."
+    cleanup
+  fi
+fi
+
+# Call the connection tool. --accept-routes is required so subnet routes
+# advertised by tailnet peers (e.g. 10.0.0.0/24 via your home router)
+# actually get installed in the routing table.
+TS_UP_ARGS=(--login-server "$HEADSCALE_URL" --accept-routes)
+if [ -n "$AUTH_KEY" ]; then
+  echo "[*] Registering with pre-auth key..."
+  $TAILSCALE up "${TS_UP_ARGS[@]}" --auth-key "$AUTH_KEY"
+else
+  echo "[*] Reconnecting with saved session..."
+  $TAILSCALE up "${TS_UP_ARGS[@]}"
+fi
+
+# Keep the script alive so the trap can listen for Ctrl+C
+while true; do
+  sleep 1
+done
