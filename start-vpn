@@ -6,10 +6,22 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # Define our paths explicitly
 TERMUX_HOME="/data/data/com.termux/files/home"
-TAILSCALED="${TERMUX_HOME}/tailscaled"
-TAILSCALE="${TERMUX_HOME}/tailscale"
-STATE_FILE="${TERMUX_HOME}/tailscaled.state"
-LOG_FILE="${TERMUX_HOME}/tailscaled.log"
+# Tailscale binaries live in ~/bin; runtime logs go to ~/logs; tailscaled's
+# persistent session state goes in ~/state.
+BIN_DIR="${TERMUX_HOME}/bin"
+LOG_DIR="${TERMUX_HOME}/logs"
+STATE_DIR="${TERMUX_HOME}/state"
+TAILSCALED="${BIN_DIR}/tailscaled"
+TAILSCALE="${BIN_DIR}/tailscale"
+# tailscaled is launched with --statedir (not just --state). This matters:
+# with only --state=<file>, tailscaled persists the *state file* there but
+# derives its profile-data directory separately — on Android that lands in a
+# non-persistent root path (e.g. /.cache/Tailscale), so the login profile
+# (node key) is lost on every restart and you get re-prompted for an auth key
+# forever. --statedir keeps the state file AND the profile data together in
+# ~/state. The state file itself defaults to <statedir>/tailscaled.state.
+STATE_FILE="${STATE_DIR}/tailscaled.state"
+LOG_FILE="${LOG_DIR}/tailscaled.log"
 PYTHON_BIN="/data/data/com.termux/files/usr/bin/python"
 
 # Persistent config (HEADSCALE_URL etc). Prompted for and saved on
@@ -24,7 +36,23 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 # Pass as first argument:  ./start-vpn <key>
 # or via env var:          AUTH_KEY=<key> ./start-vpn
 # If empty and not yet registered, you'll be prompted.
-AUTH_KEY="${1:-${AUTH_KEY:-}}"
+#
+# Special first argument `recover`: skip starting anything and just undo any
+# leftover state from a previous run that exited badly (phone killed Termux,
+# etc.) — restores Mullvad's DNS from the saved snapshot in /data/local/tmp,
+# clears the stale route, resets /etc/resolv.conf and remounts / read-only.
+# Use this instead of rebooting when the network is wedged.
+MODE="run"
+if [ "${1:-}" = "recover" ] || [ "${1:-}" = "--cleanup" ]; then
+  MODE="recover"
+fi
+# Don't treat the `recover` subcommand as an auth key. (We leave "$@" intact
+# so the token survives the su re-exec below and is re-detected as root.)
+if [ "$MODE" = "run" ]; then
+  AUTH_KEY="${1:-${AUTH_KEY:-}}"
+else
+  AUTH_KEY=""
+fi
 
 # DNS to use for tailscaled's Go resolver during startup (Mullvad will tunnel
 # the query). Once tailscaled is up it'll swap /etc/resolv.conf to MagicDNS.
@@ -49,6 +77,23 @@ detect_egress_if() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '/dev/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
 }
 
+# Install a default route into the 'main' table via Mullvad's tun so
+# tailscaled's fwmark-tagged outbound sockets can actually leave the device
+# (see the long comment at the call site). Idempotent: it deletes any
+# existing default in main first, so it's safe to re-run after a Mullvad
+# re-handshake that may have changed the tun.
+setup_egress_route() {
+  local egress_if
+  egress_if=$(detect_egress_if)
+  if [ -n "$egress_if" ]; then
+    echo "[*] Routing tailscaled's marked traffic via $egress_if (Mullvad)..."
+    ip route del default table main >/dev/null 2>&1
+    ip route add default dev "$egress_if" table main
+  else
+    echo "[-] Warning: could not detect egress interface. Is Mullvad connected?"
+  fi
+}
+
 # Snapshot Mullvad's current DnsOptions, then tell its daemon (live, no
 # restart) to advertise MagicDNS as the tunnel DNS. Mullvad re-handshakes
 # the tunnel as part of applying the change (~3-5s of network blip).
@@ -67,13 +112,28 @@ mullvad_dns_set() {
   echo "[-] Mullvad didn't come back within 15s; continuing anyway."
 }
 
-# Restore the snapshot taken by mullvad_dns_set. Safe to call even if
-# the snapshot is missing (e.g. when the script crashed before saving).
+# Restore Mullvad's DnsOptions. Mullvad persists this setting across reboots,
+# so if we leave it pointing at MagicDNS (100.100.100.100) the device has no
+# working DNS the moment Mullvad reconnects — even with tailscaled gone and
+# start-vpn never run. That's the "network broken after reboot" failure.
+#
+# Normal path: restore the exact snapshot we took in mullvad_dns_set.
+# If the snapshot is gone (a reboot can wipe /data/local/tmp) we can't know
+# the user's original DNS — but we must NOT leave the dead MagicDNS in place,
+# so in recover mode we force Mullvad's DNS back to its default as a safe
+# baseline. (In the normal run path a missing snapshot means we never changed
+# anything, so there's nothing to undo.)
 mullvad_dns_restore() {
-  [ -f "$MULLVAD_DNS_SAVE" ] || return 0
-  echo "[*] Restoring Mullvad's original DnsOptions (brief re-handshake)..."
-  PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" restore "$MULLVAD_DNS_SAVE" \
-    && rm -f "$MULLVAD_DNS_SAVE"
+  if [ -f "$MULLVAD_DNS_SAVE" ]; then
+    echo "[*] Restoring Mullvad's original DnsOptions (brief re-handshake)..."
+    PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" restore "$MULLVAD_DNS_SAVE" \
+      && rm -f "$MULLVAD_DNS_SAVE"
+    return
+  fi
+  if [ "$MODE" = "recover" ]; then
+    echo "[*] No DNS snapshot found; forcing Mullvad DNS back to default..."
+    PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" default
+  fi
 }
 
 # Re-exec under su if not already root. Lets the user invoke this script
@@ -83,8 +143,9 @@ if [ "$EUID" -ne 0 ]; then
   exec su -c "$(printf '%q ' "$SELF" "$@")"
 fi
 
-# First-run setup: prompt for the Headscale URL and persist it.
-if [ -z "${HEADSCALE_URL:-}" ]; then
+# First-run setup: prompt for the Headscale URL and persist it. Skipped in
+# recover mode, which only tears down leftover state and needs no config.
+if [ "$MODE" = "run" ] && [ -z "${HEADSCALE_URL:-}" ]; then
   echo "[*] First-time setup: need your Headscale server URL."
   read -r -p "    Headscale URL (e.g. https://vpn.example.com): " HEADSCALE_URL
   if [ -z "$HEADSCALE_URL" ]; then
@@ -96,9 +157,40 @@ if [ -z "${HEADSCALE_URL:-}" ]; then
   echo "[*] Saved to $CONFIG_FILE"
 fi
 
-# Function to clean up processes when Ctrl+C is pressed
+# Make sure the tailscale binaries are where we expect them. They aren't
+# shipped with this repo — download the static builds from
+# https://pkgs.tailscale.com/stable/#static and drop them in ~/bin.
+# (Recover mode doesn't need them — it only undoes leftover state.)
+if [ "$MODE" = "run" ] && { [ ! -x "$TAILSCALED" ] || [ ! -x "$TAILSCALE" ]; }; then
+  echo "[-] Missing tailscale binaries in $BIN_DIR." >&2
+  echo "    Expected: $TAILSCALE and $TAILSCALED" >&2
+  echo "    Download the static builds from https://pkgs.tailscale.com/stable/#static" >&2
+  echo "    and place them in $BIN_DIR (chmod +x)." >&2
+  exit 1
+fi
+
+# Ensure the log and state directories exist before tailscaled writes to them.
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+
+# Undo every system-wide change we made, in reverse order. This is the
+# function that keeps the phone usable after we exit: if it doesn't run,
+# the device is left with Mullvad's DNS pinned to a now-dead MagicDNS
+# address, /etc/resolv.conf pointing at the same dead server, and a stale
+# default route in the main table — which is exactly the "no internet until
+# I reboot" symptom.
+#
+# It's guarded so it runs exactly once, and idempotent so partial startups
+# (tailscaled never came up, route never added, etc.) clean up fine — every
+# step tolerates "nothing to undo".
+CLEANED_UP=0
 cleanup() {
-  echo -e "\n[!] Ctrl+C detected. Shutting down connections safely..."
+  [ "$CLEANED_UP" -eq 1 ] && return
+  CLEANED_UP=1
+  # Stop re-entry: we don't want a second signal (or the EXIT trap firing
+  # after our own `exit`) to run this again mid-flight.
+  trap - EXIT SIGINT SIGTERM SIGHUP
+
+  echo -e "\n[!] Shutting down and restoring the network..."
 
   echo "[*] Disconnecting from Headscale..."
   $TAILSCALE down >/dev/null 2>&1
@@ -110,18 +202,39 @@ cleanup() {
   # left with a dangling route if it disconnects.
   ip route del default table main >/dev/null 2>&1
 
-  # Hand Mullvad's DNS back to whatever it was before we started.
+  # Hand Mullvad's DNS back to whatever it was before we started. This is
+  # the device-wide DNS, so skipping it breaks name resolution for every app.
   mullvad_dns_restore
+
+  # tailscaled rewrites /etc/resolv.conf to MagicDNS (100.100.100.100) once
+  # connected. With tailscaled gone that server is dead, so put a working
+  # resolver back before we remount read-only (we need rw to write it).
+  if [ -w /etc/resolv.conf ] || [ -d /etc ]; then
+    echo "nameserver $RESOLV_DNS" > /etc/resolv.conf 2>/dev/null
+  fi
 
   # Restore the read-only mount we flipped on startup.
   mount -o remount,ro / >/dev/null 2>&1
 
-  echo "[+] All cleaned up. Exiting."
+  echo "[+] All cleaned up. Network restored."
   exit 0
 }
 
-# Trap the Ctrl+C (SIGINT) and exit (SIGTERM) signals
-trap cleanup SIGINT SIGTERM
+# Run cleanup on Ctrl+C (INT), termination (TERM), the controlling terminal
+# going away (HUP — e.g. Termux swiped from recents or the su session dying),
+# and on ANY other exit (EXIT) so a failure *after* we've started changing
+# system state still tears everything back down instead of leaving the phone
+# wedged. The trap is registered here, before the first state-mutating step.
+trap cleanup EXIT SIGINT SIGTERM SIGHUP
+
+# Recover mode: don't start anything — just run the teardown to unwedge the
+# network after a previous run died without cleaning up, then exit. Remount
+# rw first so cleanup can rewrite /etc/resolv.conf.
+if [ "$MODE" = "recover" ]; then
+  echo "[*] Recover mode: undoing leftover state from a previous run..."
+  mount -o remount,rw / 2>/dev/null
+  cleanup
+fi
 
 # Kill any stray tailscaled processes before starting
 pkill tailscaled >/dev/null 2>&1
@@ -139,31 +252,24 @@ if [ ! -f /etc/resolv.conf ]; then
   echo "nameserver $RESOLV_DNS" > /etc/resolv.conf
 fi
 
-# Push MagicDNS to Mullvad live (no daemon restart). This is what lets
-# every app on the device — including DoH-defaulting browsers — pick up
-# split-horizon names like admin.homefree.host, because Mullvad announces
-# the DNS server to all apps via Android's VpnService API.
-mullvad_dns_set
+# NOTE: We deliberately do NOT touch Mullvad's DNS yet. Swapping it to
+# MagicDNS (100.100.100.100) only makes sense once tailscaled is connected
+# and that address actually answers; doing it now would black-hole DNS for
+# the whole device — including the browser you need to open the Headscale
+# admin UI to generate a pre-auth key. The swap happens after `tailscale up`.
 
 # tailscaled sets fwmark 0x80000 on its own outbound sockets so they don't
 # loop back through its TUN. Routing rule 5210 sends those marked packets
 # to the 'main' table, which on Android has no default route. Result:
 # every dial returns "network is unreachable" before any login URL is
 # generated. Fix: copy the egress interface (Mullvad's tun) into main.
-EGRESS_IF=$(detect_egress_if)
-if [ -n "$EGRESS_IF" ]; then
-  echo "[*] Routing tailscaled's marked traffic via $EGRESS_IF (Mullvad)..."
-  ip route del default table main >/dev/null 2>&1
-  ip route add default dev "$EGRESS_IF" table main
-else
-  echo "[-] Warning: could not detect egress interface. Is Mullvad connected?"
-fi
+setup_egress_route
 
 echo "[*] Starting tailscaled engine in background..."
 echo "[*] tailscaled log: $LOG_FILE"
 # Log tailscaled stdout/stderr so we can debug hangs
 : > "$LOG_FILE"
-$TAILSCALED --tun=userspace-tun --state=$STATE_FILE >>"$LOG_FILE" 2>&1 &
+$TAILSCALED --tun=userspace-tun --statedir="$STATE_DIR" >>"$LOG_FILE" 2>&1 &
 
 # Wait for tailscaled's local API socket to be responsive (up to ~15s).
 # `tailscale status` returns 0 when logged in, non-zero with "Logged out"
@@ -201,6 +307,17 @@ else
   echo "[*] Reconnecting with saved session..."
   $TAILSCALE up "${TS_UP_ARGS[@]}"
 fi
+
+# Now that tailscaled is connected and MagicDNS (100.100.100.100) actually
+# answers, push it to Mullvad so every app on the device — including
+# DoH-defaulting browsers — resolves split-horizon names. Doing this here,
+# after `up`, is what keeps normal DNS working during the auth-key step above.
+mullvad_dns_set
+
+# mullvad_dns_set re-handshakes Mullvad's tunnel, which can swap the egress
+# tun out from under the route we installed earlier. Re-assert it so
+# tailscaled's marked traffic keeps a valid exit.
+setup_egress_route
 
 # Keep the script alive so the trap can listen for Ctrl+C
 while true; do
