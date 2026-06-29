@@ -42,12 +42,21 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 # etc.) — restores Mullvad's DNS from the saved snapshot in /data/local/tmp,
 # clears the stale route, resets /etc/resolv.conf and remounts / read-only.
 # Use this instead of rebooting when the network is wedged.
+#
+# `__teardown` is an INTERNAL subcommand the non-root supervisor (see the
+# re-exec block below) runs as root after a session ends. It's identical to
+# `recover` EXCEPT it never force-resets Mullvad's DNS to default when no
+# snapshot is found — a missing snapshot in the teardown path means the run's
+# own cleanup already restored it, so there's nothing to do. (`recover`, the
+# manual unwedge command, DOES force default in that case.)
 MODE="run"
 if [ "${1:-}" = "recover" ] || [ "${1:-}" = "--cleanup" ]; then
   MODE="recover"
+elif [ "${1:-}" = "__teardown" ]; then
+  MODE="teardown"
 fi
-# Don't treat the `recover` subcommand as an auth key. (We leave "$@" intact
-# so the token survives the su re-exec below and is re-detected as root.)
+# Don't treat a subcommand as an auth key. (We leave "$@" intact so a real
+# key token survives the su re-exec below and is re-detected as root.)
 if [ "$MODE" = "run" ]; then
   AUTH_KEY="${1:-${AUTH_KEY:-}}"
 else
@@ -94,13 +103,47 @@ setup_egress_route() {
   fi
 }
 
+# Kill any running tailscaled and WAIT for it to actually exit. This matters:
+# `pkill` only *sends* a signal — it returns immediately while tailscaled does
+# its (multi-second) graceful shutdown, during which it still holds the
+# userspace-tun device open. If we launch a fresh tailscaled in that window it
+# dies with "TUN device userspace-tun is busy ... device or resource busy" and
+# never connects. So poll until the old process is gone, escalating to SIGKILL.
+kill_tailscaled() {
+  pgrep tailscaled >/dev/null 2>&1 || return 0
+  pkill tailscaled >/dev/null 2>&1
+  local i
+  for i in $(seq 1 10); do
+    pgrep tailscaled >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  # Still alive after ~10s of graceful shutdown — force it and wait again.
+  echo "[*] tailscaled didn't exit gracefully; sending SIGKILL..."
+  pkill -9 tailscaled >/dev/null 2>&1
+  for i in $(seq 1 5); do
+    pgrep tailscaled >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  echo "[-] Warning: tailscaled still present after SIGKILL; the TUN may stay busy."
+}
+
 # Snapshot Mullvad's current DnsOptions, then tell its daemon (live, no
 # restart) to advertise MagicDNS as the tunnel DNS. Mullvad re-handshakes
 # the tunnel as part of applying the change (~3-5s of network blip).
 mullvad_dns_set() {
-  echo "[*] Saving Mullvad's current DnsOptions snapshot..."
-  PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" save "$MULLVAD_DNS_SAVE" \
-    || { echo "[-] Couldn't reach Mullvad's gRPC socket. Is Mullvad running?"; return 1; }
+  # Snapshot Mullvad's current DnsOptions so teardown can restore them — but
+  # ONLY if we don't already have a snapshot. A leftover snapshot means a
+  # previous run set MagicDNS and never tore down, so the *current* DNS is now
+  # MagicDNS. Re-saving here would capture that leaked value and "restore" the
+  # device into a broken state on exit (DNS pinned to a dead 100.100.100.100).
+  # Keep the existing snapshot — it holds the genuine pre-MagicDNS original.
+  if [ -f "$MULLVAD_DNS_SAVE" ]; then
+    echo "[*] Keeping existing Mullvad DNS snapshot (a previous run left one)."
+  else
+    echo "[*] Saving Mullvad's current DnsOptions snapshot..."
+    PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" save "$MULLVAD_DNS_SAVE" \
+      || { echo "[-] Couldn't reach Mullvad's gRPC socket. Is Mullvad running?"; return 1; }
+  fi
   echo "[*] Switching Mullvad's tunnel DNS to $MAGIC_DNS (brief re-handshake)..."
   PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" custom "$MAGIC_DNS"
   # Wait until Mullvad reports Connected again before moving on, otherwise
@@ -125,6 +168,17 @@ mullvad_dns_set() {
 # anything, so there's nothing to undo.)
 mullvad_dns_restore() {
   if [ -f "$MULLVAD_DNS_SAVE" ]; then
+    # Safety net for an already-poisoned snapshot: if the saved blob itself
+    # contains MagicDNS, restoring it would just re-apply the dead
+    # 100.100.100.100 and wedge DNS. Treat it as poisoned and force Mullvad's
+    # DNS back to default instead. This self-heals state left by older buggy
+    # runs (and by hard kills mid-session).
+    if grep -Fq -- "$MAGIC_DNS" "$MULLVAD_DNS_SAVE" 2>/dev/null; then
+      echo "[!] Saved DNS snapshot is poisoned (contains $MAGIC_DNS); forcing Mullvad DNS to default."
+      PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" default \
+        && rm -f "$MULLVAD_DNS_SAVE"
+      return
+    fi
     echo "[*] Restoring Mullvad's original DnsOptions (brief re-handshake)..."
     PYTHONPATH="$MULLVAD_DNS_PYPATH" "$PYTHON_BIN" "$MULLVAD_DNS_PY" restore "$MULLVAD_DNS_SAVE" \
       && rm -f "$MULLVAD_DNS_SAVE"
@@ -136,11 +190,47 @@ mullvad_dns_restore() {
   fi
 }
 
-# Re-exec under su if not already root. Lets the user invoke this script
-# as themselves (e.g. `./start-vpn <key>`) without prefixing `su -c '...'`.
+# Run the privileged work under su — but DON'T `exec` into it. We deliberately
+# keep THIS non-root shell alive as a supervisor.
+#
+# Why: under MagiskSU the command given to `su -c` runs in its own session,
+# reparented to the magisk daemon — it is NOT in the terminal's foreground
+# process group. So Ctrl+C's SIGINT never reaches it, and when the su client
+# dies magiskd SIGKILLs the root child. A cleanup trap *inside* the su'd
+# process therefore can never run on Ctrl+C, which is exactly why Mullvad's
+# DNS was left toggled on after exit.
+#
+# This outer shell, by contrast, is a normal Termux process in the terminal's
+# foreground group, so it reliably catches Ctrl+C (and TERM/HUP). On any of
+# those — or when the root process returns on its own — we run teardown as
+# root via a fresh `su -c ... __teardown`, which restores Mullvad's DNS,
+# kills tailscaled, clears the route, and remounts ro. Teardown is idempotent
+# and snapshot-based, so running it even after a clean inner exit is safe.
 if [ "$EUID" -ne 0 ]; then
   SELF="$(readlink -f "$0")"
-  exec su -c "$(printf '%q ' "$SELF" "$@")"
+  SELF_Q="$(printf '%q ' "$SELF")"
+
+  run_root_teardown() {
+    su -c "${SELF_Q}__teardown"
+  }
+  on_supervisor_signal() {
+    trap - INT TERM HUP
+    printf '\n[*] Interrupt received — tearing down the VPN as root...\n'
+    run_root_teardown
+    exit 0
+  }
+  trap on_supervisor_signal INT TERM HUP
+
+  # Hand control to the privileged run. Blocks until the root process exits
+  # (or Ctrl+C trips the trap above, which tears down and exits).
+  su -c "$(printf '%q ' "$SELF" "$@")"
+  rc=$?
+
+  # Root process ended without us catching a signal (normal/error exit, or it
+  # was killed). Run teardown to guarantee the network is restored regardless
+  # of whether the inner cleanup got to run.
+  run_root_teardown
+  exit "$rc"
 fi
 
 # First-run setup: prompt for the Headscale URL and persist it. Skipped in
@@ -196,7 +286,8 @@ cleanup() {
   $TAILSCALE down >/dev/null 2>&1
 
   echo "[*] Killing tailscaled background engine..."
-  pkill tailscaled >/dev/null 2>&1
+  # Wait for it to fully exit so a subsequent run can reopen the TUN cleanly.
+  kill_tailscaled
 
   # Remove the main-table default route we added so Mullvad's tun isn't
   # left with a dangling route if it disconnects.
@@ -227,17 +318,19 @@ cleanup() {
 # wedged. The trap is registered here, before the first state-mutating step.
 trap cleanup EXIT SIGINT SIGTERM SIGHUP
 
-# Recover mode: don't start anything — just run the teardown to unwedge the
-# network after a previous run died without cleaning up, then exit. Remount
-# rw first so cleanup can rewrite /etc/resolv.conf.
-if [ "$MODE" = "recover" ]; then
-  echo "[*] Recover mode: undoing leftover state from a previous run..."
+# Recover/teardown modes: don't start anything — just run cleanup to undo
+# leftover state, then exit. `recover` is the manual unwedge command;
+# `__teardown` is what the non-root supervisor runs after every session.
+# Remount rw first so cleanup can rewrite /etc/resolv.conf.
+if [ "$MODE" = "recover" ] || [ "$MODE" = "teardown" ]; then
+  [ "$MODE" = "recover" ] && echo "[*] Recover mode: undoing leftover state from a previous run..."
   mount -o remount,rw / 2>/dev/null
   cleanup
 fi
 
-# Kill any stray tailscaled processes before starting
-pkill tailscaled >/dev/null 2>&1
+# Kill any stray tailscaled processes before starting — and WAIT for them to
+# release the userspace-tun device, or our new daemon fails to start.
+kill_tailscaled
 
 # tailscaled needs to read AND rewrite /etc/resolv.conf at runtime:
 #   - on startup, to resolve $HEADSCALE_URL (needs `nameserver` line)

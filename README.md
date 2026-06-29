@@ -54,7 +54,9 @@ You'll get prompted for two things on the first run:
 1. **Headscale URL** (e.g. `https://vpn.example.com`). Saved to `~/.config/termux-vpn-nest/config` so you only enter it once.
 2. **Pre-auth key** from your Headscale admin UI. Used once for registration; tailscaled saves the session in `~/state/tailscaled.state` for subsequent runs. The Mullvad DNS swap happens *after* this step, so your normal internet still works while you open the admin UI to generate the key.
 
-Hit `Ctrl+C` to tear down. The script restores Mullvad's original DNS settings (another brief re-handshake), kills tailscaled, removes the custom route, resets `/etc/resolv.conf`, and remounts `/` read-only. The same teardown also runs if the script exits any other way — an error mid-startup, or Termux being closed (`SIGHUP`) — so it shouldn't leave the network wedged.
+Hit `Ctrl+C` to tear down. The script restores Mullvad's original DNS settings (another brief re-handshake), kills tailscaled, removes the custom route, resets `/etc/resolv.conf`, and remounts `/` read-only. The same teardown also runs if the script exits any other way — an error mid-startup, or Termux being closed — so it shouldn't leave the network wedged.
+
+**How teardown survives `Ctrl+C` under Magisk.** When you run `start-vpn` as your normal user it relaunches the privileged work under `su`. Under MagiskSU that root process runs in its own session, reparented to the magisk daemon — it is *not* in the terminal's foreground process group, so `Ctrl+C`'s `SIGINT` never reaches it, and when the `su` client dies magiskd `SIGKILL`s the root child (uncatchable). A cleanup trap *inside* the root process therefore can never run on `Ctrl+C` (this was the original "DNS left toggled on after exit" bug). Instead, the original non-root shell stays alive as a **supervisor**: it's a normal foreground process, so it catches `Ctrl+C` reliably and then runs teardown as root via a fresh `su` call. Teardown is idempotent and snapshot-based, so it's safe whether the inner run was killed or exited cleanly.
 
 ## Recovering a wedged network
 
@@ -71,6 +73,12 @@ Two ways to fix it:
 
   It starts nothing; it just undoes leftover state — restores Mullvad's DNS from the snapshot in `/data/local/tmp`, or, if that snapshot was wiped (a reboot can clear `/data/local/tmp`), forces Mullvad's DNS back to its default. It also clears the stale route, resets `/etc/resolv.conf`, and remounts `/` read-only.
 
+### DNS isn't restored after `Ctrl+C`
+
+`Ctrl+C` *is* the intended way to exit, and it triggers the full teardown (you'll see `[!] Shutting down and restoring the network...`). If you saw that message but DNS stayed broken, the cause was a **poisoned DNS snapshot**: the script saves Mullvad's "original" DNS to `/data/local/tmp/start-vpn-mullvad-dns.bin` before swapping in MagicDNS, but if a run died without tearing down and a *later* run re-saved, the snapshot captured the already-swapped `100.100.100.100` — so teardown faithfully "restored" the device back to the dead MagicDNS resolver.
+
+This now self-heals: the script only snapshots when one doesn't already exist (so the genuine original is never overwritten), and teardown refuses to restore a snapshot that contains `100.100.100.100`, forcing Mullvad's DNS to default instead. A snapshot left over from the old behavior is cleared automatically on the next exit or `start-vpn recover`.
+
 ## Subsequent runs
 
 Just `start-vpn` — it'll reuse the saved session and the saved Headscale URL. If you want to force re-registration, generate a new key and pass it:
@@ -80,6 +88,10 @@ start-vpn nodekey:abcdef...
 # or
 AUTH_KEY=nodekey:abcdef... start-vpn
 ```
+
+### A second run won't connect (`TUN device userspace-tun is busy`)
+
+If you stop a session and immediately start a new one, the new `tailscaled` can fail with `device or resource busy` and never connect — the previous daemon was still doing its (multi-second) graceful shutdown and hadn't released the userspace-tun device yet. `start-vpn` now kills the old `tailscaled` and **waits for it to actually exit** (escalating to `SIGKILL`) before launching a new one, both on teardown and at startup, so back-to-back runs work. If you ever still hit it, just wait a few seconds and re-run.
 
 ### It keeps asking for a pre-auth key every run
 
@@ -96,7 +108,7 @@ The session should persist in `~/state` so subsequent runs reconnect without a k
 ## Caveats
 
 - Setting Mullvad's DNS via the gRPC API triggers a WireGuard re-handshake (~3–5s of network outage). The script polls until ping recovers before continuing.
-- Teardown runs on `Ctrl+C`, on termination/hangup signals, and on any other exit, so normal exits and crashes both clean up. Only an uncatchable `kill -9` (or a hard reboot) can still skip it — in that case run `start-vpn recover` (see above) to unwedge without rebooting.
+- Teardown runs from the non-root supervisor shell on `Ctrl+C`, on termination/hangup signals, and on any other exit, so normal exits and crashes both clean up (see "How teardown survives `Ctrl+C` under Magisk" above). Only a `kill -9` of the *supervisor itself* (or a hard reboot) can skip it — in that case run `start-vpn recover` to unwedge without rebooting.
 - The script remounts `/` rw briefly so tailscaled can write `/etc/resolv.conf`. It puts it back ro on teardown.
 - Mullvad's proto layout was reverse-engineered against [their open-source `management_interface.proto`](https://github.com/mullvad/mullvadvpn-app/blob/main/mullvad-management-interface/proto/management_interface.proto). If Mullvad changes the wire format, `mullvad_dns.py` may need updating.
 
