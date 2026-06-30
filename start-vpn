@@ -190,6 +190,15 @@ mullvad_dns_restore() {
   fi
 }
 
+# Termux's session drawer (and the notification) shows whatever title a session
+# sets via the OSC terminal escape, so we set one while the VPN is up to make
+# the VPN session easy to pick out among many, and clear it on teardown so a
+# freed session stops claiming it's running the VPN. Write to the controlling
+# terminal directly (not stdout, which a redirect could swallow); harmless if
+# there's no tty. Override the text with VPN_SESSION_TITLE=... start-vpn.
+SESSION_TITLE="${VPN_SESSION_TITLE:-🔒 vpn-nest}"
+set_term_title() { printf '\033]0;%s\007' "$1" >/dev/tty 2>/dev/null; }
+
 # Run the privileged work under su — but DON'T `exec` into it. We deliberately
 # keep THIS non-root shell alive as a supervisor.
 #
@@ -210,6 +219,9 @@ if [ "$EUID" -ne 0 ]; then
   SELF="$(readlink -f "$0")"
   SELF_Q="$(printf '%q ' "$SELF")"
 
+  # Only a real session ("run") gets the badge; recover/teardown are transient.
+  [ "$MODE" = "run" ] && set_term_title "$SESSION_TITLE"
+
   run_root_teardown() {
     su -c "${SELF_Q}__teardown"
   }
@@ -217,6 +229,7 @@ if [ "$EUID" -ne 0 ]; then
     trap - INT TERM HUP
     printf '\n[*] Interrupt received — tearing down the VPN as root...\n'
     run_root_teardown
+    [ "$MODE" = "run" ] && set_term_title ""
     exit 0
   }
   trap on_supervisor_signal INT TERM HUP
@@ -230,6 +243,7 @@ if [ "$EUID" -ne 0 ]; then
   # was killed). Run teardown to guarantee the network is restored regardless
   # of whether the inner cleanup got to run.
   run_root_teardown
+  [ "$MODE" = "run" ] && set_term_title ""
   exit "$rc"
 fi
 
