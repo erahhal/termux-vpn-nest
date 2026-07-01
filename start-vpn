@@ -376,6 +376,14 @@ echo "[*] Starting tailscaled engine in background..."
 echo "[*] tailscaled log: $LOG_FILE"
 # Log tailscaled stdout/stderr so we can debug hangs
 : > "$LOG_FILE"
+# Nested-tunnel MTU clamp. tailscaled sizes its tun assuming a ~1500B physical
+# underlay (→ default 1280), but here the underlay IS Mullvad's tun (also 1280).
+# A full-size 1280 inner packet + WireGuard's ~60-80B overhead exceeds Mullvad's
+# 1280 MTU and gets silently dropped — small packets (DNS, MagicDNS, metadata
+# sync, pings) pass, but bulk transfers (photo/video uploads) stall mid-stream.
+# Clamp the inner MTU so inner+overhead fits inside Mullvad. 1200 measured working
+# (upload 16KB/s stalled → 422KB/s); drop to ~1160 if large transfers still hang.
+export TS_DEBUG_MTU="${TS_DEBUG_MTU:-1200}"
 $TAILSCALED --tun=userspace-tun --statedir="$STATE_DIR" >>"$LOG_FILE" 2>&1 &
 
 # Wait for tailscaled's local API socket to be responsive (up to ~15s).
