@@ -384,6 +384,13 @@ echo "[*] tailscaled log: $LOG_FILE"
 # Clamp the inner MTU so inner+overhead fits inside Mullvad. 1200 measured working
 # (upload 16KB/s stalled → 422KB/s); drop to ~1160 if large transfers still hang.
 export TS_DEBUG_MTU="${TS_DEBUG_MTU:-1200}"
+# Disable peer Path-MTU Discovery. TS_DEBUG_MTU only sizes the inner tun; magicsock
+# separately probes the OUTER WireGuard/UDP path and, over a normal underlay, settles
+# on ~1360. But that outer traffic is routed through Mullvad's 1280-MTU tun, so 1360B
+# datagrams exceed 1280 and are silently dropped (ICMP-too-big can't get back through
+# Mullvad, so the probes falsely "succeed") — bulk transfers stall even with the inner
+# clamp in place. Disabling PMTUD forces conservative sizing based on TS_DEBUG_MTU.
+export TS_DEBUG_ENABLE_PMTUD="${TS_DEBUG_ENABLE_PMTUD:-false}"
 $TAILSCALED --tun=userspace-tun --statedir="$STATE_DIR" >>"$LOG_FILE" 2>&1 &
 
 # Wait for tailscaled's local API socket to be responsive (up to ~15s).
